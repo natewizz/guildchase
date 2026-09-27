@@ -58,4 +58,4 @@ Sign in as the owner to toggle cards. Everyone else can browse the collection.
 
 ## Deploy
 
-Import this repo in Vercel. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. Do not add the service role key to Vercel.
+Import this repo in Vercel. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`. Do not add the service role key to Vercel.

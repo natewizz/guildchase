@@ -219,8 +219,7 @@ declare
 begin
   delete from public.cards
   where rarity is not null
-    and rarity <> 'common'
-    and land_type not in ('Snow', 'Wastes');
+    and rarity <> 'common';
   get diagnostics removed_non_common = row_count;
 
   delete from public.cards where collector_number like '%★%';

@@ -9,3 +9,9 @@ out
 next-env.d.ts
 .DS_Store
 npm-debug.log*
+
+.vercel
+.env*
+!.env.example
+gethzlpy_lands.sql
+supabase/.temp/

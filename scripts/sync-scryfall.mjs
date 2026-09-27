@@ -12,7 +12,7 @@
 import { createClient } from "@supabase/supabase-js";
 
 const API = "https://api.scryfall.com";
-const EXCLUDED_TYPES = ["token", "memorabilia", "minigame", "vanguard", "alchemy", "treasure_chest"];
+const EXCLUDED_TYPES = ["token", "memorabilia", "minigame", "vanguard", "alchemy", "treasure_chest", "promo"];
 const EXCLUDED_SETS = [
   "FBB", "4BB",
   "PMPS", "PMPS07", "PMPS08", "PMPS09", "PMPS10", "PMPS11",
@@ -29,6 +29,7 @@ const opt = (name, fallback) => {
 };
 
 const discover = has("--discover");
+const pruneOnly = has("--prune-only");
 const dryRun = has("--dry-run");
 const prune = has("--prune");
 const updateImages = has("--update-images");
@@ -63,23 +64,6 @@ function finishToVariant(finish, isFullArt) {
   if ((finish === "foil" || finish === "etched") && !isFullArt) return "foil_regular";
   if ((finish === "foil" || finish === "etched") && isFullArt) return "foil_full_art";
   return null;
-}
-
-function numericCollector(value) {
-  const match = String(value).match(/^(\d+)/);
-  return match ? Number(match[1]) : Number(value);
-}
-
-function isExtraShowcase(card, printings) {
-  if (!card.full_art) return false;
-  const type = landType(card.name);
-  const number = numericCollector(card.collector_number);
-  return printings.some((other) => {
-    if (other.collector_number === card.collector_number) return false;
-    if (!other.full_art) return false;
-    if (landType(other.name) !== type) return false;
-    return numericCollector(other.collector_number) < number;
-  });
 }
 
 function imageUrl(card) {
@@ -130,11 +114,10 @@ function printableCards(cards) {
 }
 
 function rowsFromCards(setId, cards) {
-  const syncable = cards.filter((card) => !isExtraShowcase(card, cards));
-  const skipped = [...new Set(cards.filter((card) => isExtraShowcase(card, cards)).map((card) => card.collector_number))];
   const rows = new Map();
 
-  for (const card of syncable) {
+  for (const card of cards) {
+    if (card.rarity && card.rarity !== "common") continue;
     const fullArt = Boolean(card.full_art);
     for (const finish of card.finishes ?? ["nonfoil"]) {
       const variant = finishToVariant(finish, fullArt);
@@ -153,7 +136,7 @@ function rowsFromCards(setId, cards) {
     }
   }
 
-  return { rows: [...rows.values()], skipped };
+  return { rows: [...rows.values()], skipped: [] };
 }
 
 async function fetchAll(table, select, filter) {
@@ -171,9 +154,13 @@ async function fetchAll(table, select, filter) {
   return rows;
 }
 
-async function loadSets() {
-  const sets = await fetchAll("sets", "id, code, name");
-  return sets.filter((set) => set.code && !EXCLUDED_SETS.includes(set.code.toUpperCase()));
+async function loadSets({ activeOnly = false } = {}) {
+  const sets = await fetchAll("sets", "id, code, name, is_active");
+  return sets.filter((set) => {
+    if (!set.code || EXCLUDED_SETS.includes(set.code.toUpperCase())) return false;
+    if (activeOnly && !set.is_active) return false;
+    return true;
+  });
 }
 
 async function discoverSets() {
@@ -269,8 +256,50 @@ async function writeCards(set, scryfallCards, existing) {
   console.log(`        → ${inserts.length} added, ${updated} updated, ${unchanged} unchanged`);
 }
 
+async function pruneExtras() {
+  const { count: nonCommon, error: rarityError } = await supabase
+    .from("cards")
+    .delete({ count: "exact" })
+    .not("rarity", "is", null)
+    .neq("rarity", "common");
+  if (rarityError) throw rarityError;
+
+  const response = await scryfall("/sets");
+  if (!response.ok) throw new Error(`Sets endpoint returned ${response.status}`);
+  const body = await response.json();
+  const promoCodes = new Set(
+    (body.data ?? [])
+      .filter((set) => set.set_type === "promo")
+      .map((set) => String(set.code).toUpperCase()),
+  );
+
+  const sets = await fetchAll("sets", "id, code, is_active");
+  const promoIds = sets
+    .filter((set) => promoCodes.has(String(set.code).toUpperCase()))
+    .map((set) => set.id);
+
+  let promoCards = 0;
+  if (promoIds.length > 0) {
+    const { count, error } = await supabase.from("cards").delete({ count: "exact" }).in("set_id", promoIds);
+    if (error) throw error;
+    promoCards = count ?? 0;
+    const { error: hideError } = await supabase.from("sets").update({ is_active: false }).in("id", promoIds);
+    if (hideError) throw hideError;
+  }
+
+  const remaining = await fetchAll("cards", "set_id");
+  const withCards = new Set(remaining.map((row) => row.set_id));
+  const emptyIds = sets.filter((set) => set.is_active && !promoIds.includes(set.id) && !withCards.has(set.id)).map((set) => set.id);
+  if (emptyIds.length > 0) {
+    const { error } = await supabase.from("sets").update({ is_active: false }).in("id", emptyIds);
+    if (error) throw error;
+  }
+
+  console.log(`Removed ${nonCommon ?? 0} above-common card(s) and ${promoCards} promo-set card(s).`);
+}
+
 async function syncExisting() {
-  let sets = await loadSets();
+  let sets = await loadSets({ activeOnly: true });
   if (onlySet) sets = sets.filter((set) => set.code.toUpperCase() === onlySet);
   if (sets.length === 0) {
     console.log("No sets to sync. Run with --discover first.");
@@ -295,15 +324,16 @@ async function syncExisting() {
 }
 
 if (dryRun) console.log("DRY RUN — no database changes will be made.");
-if (discover) await discoverSets();
-if (!discover || has("--sync")) await syncExisting();
-if (prune) {
+if (!pruneOnly && discover) await discoverSets();
+if (!pruneOnly && (!discover || has("--sync"))) await syncExisting();
+if (prune || pruneOnly) {
   if (dryRun) {
     console.log("Prune skipped during dry run.");
   } else {
     const { data, error } = await supabase.rpc("prune_catalog");
     if (error) throw error;
     console.log("Pruned catalog:", data);
+    await pruneExtras();
   }
 }
 console.log(dryRun ? "Dry run finished." : "Sync finished.");
